@@ -1,0 +1,11 @@
+1. Which parts of the page table get mapped at the highest addresses in user memory? Describe the mappings.
+
+The highest addresses in user memory contain the trampoline page (at TRAMPOLINE, mapped from kernel trampoline code with PTE_R|PTE_X), the trapframe page (at TRAPFRAME, mapped from the per-process trapframe with PTE_R|PTE_W), and the USYSCALL page (at USYSCALL, mapped from the per-process usyscall struct with PTE_R|PTE_U). These are all within the top three pages of the virtual address space.
+
+2. What is the advantage of having a separate kernel page table per process? What is the advantage of having a single kernel page table that all processes share?
+
+A separate kernel page table per process allows the kernel to map user pages into the kernel's address space during system calls (via u2kvmcopy), enabling efficient copyin/copyout without needing to switch page tables. This avoids the need for a "wired" mapping of all user pages into a shared kernel page table, saving TLB pressure. The disadvantage is that switching processes requires switching the SATP to the per-process kernel page table, and there is higher memory overhead for maintaining multiple kernel page tables.
+
+3. What is the purpose of the USYSCALL mapping? How does ugetpid() use it?
+
+The USYSCALL mapping provides a read-only page shared between the kernel and each user process, containing the process's PID. This allows ugetpid() to read the PID without performing a system call (no ecall), by directly dereferencing the USYSCALL virtual address. This is faster than a traditional getpid() system call since it avoids the overhead of trapping into the kernel.

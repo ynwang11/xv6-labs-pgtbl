@@ -59,6 +59,11 @@ OBJS += \
 	$K/pci.o
 endif
 
+ifeq ($(LAB),pgtbl)
+OBJS += \
+	$K/vmcopyin.o
+endif
+
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin

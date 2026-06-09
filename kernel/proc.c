@@ -26,21 +26,21 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
-// Allocate a page for each process's kernel stack.
-// Map it high in memory, followed by an invalid
-// guard page.
-void
-proc_mapstacks(pagetable_t kpgtbl)
+// Free a process kernel page table without freeing mapped physical pages.
+static void
+proc_freekernelpt(pagetable_t kernelpt)
 {
-  struct proc *p;
-  
-  for(p = proc; p < &proc[NPROC]; p++) {
-    char *pa = kalloc();
-    if(pa == 0)
-      panic("kalloc");
-    uint64 va = KSTACK((int) (p - proc));
-    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  for(int i = 0; i < 512; i++){
+    pte_t pte = kernelpt[i];
+    if(pte & PTE_V){
+      kernelpt[i] = 0;
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        uint64 child = PTE2PA(pte);
+        proc_freekernelpt((pagetable_t)child);
+      }
+    }
   }
+  kfree((void*)kernelpt);
 }
 
 // initialize the proc table.
@@ -132,6 +132,14 @@ found:
     return 0;
   }
 
+  // Allocate a USYSCALL page.
+  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->usyscall->pid = p->pid;
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -139,6 +147,25 @@ found:
     release(&p->lock);
     return 0;
   }
+
+  // Per-process kernel page table.
+  p->kernelpt = proc_kpt_init();
+  if(p->kernelpt == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Allocate and map a kernel stack for this process.
+  char *pa = kalloc();
+  if(pa == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  uint64 va = KSTACK((int) (p - proc));
+  kvmmap(p->kernelpt, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -158,9 +185,19 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->usyscall)
+    kfree((void*)p->usyscall);
+  p->usyscall = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if(p->kernelpt){
+    if(p->kstack)
+      uvmunmap(p->kernelpt, p->kstack, 1, 1);
+    proc_freekernelpt(p->kernelpt);
+    p->kernelpt = 0;
+    p->kstack = 0;
+  }
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -202,6 +239,15 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+  // map the USYSCALL page just below the trapframe page, for ugetpid.
+  if(mappages(pagetable, USYSCALL, PGSIZE,
+              (uint64)(p->usyscall), PTE_R | PTE_U | PTE_A) < 0){
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
   return pagetable;
 }
 
@@ -212,6 +258,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -241,6 +288,7 @@ userinit(void)
   // and data into it.
   uvmfirst(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  u2kvmcopy(p->pagetable, p->kernelpt, 0, p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -264,11 +312,24 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(PGROUNDUP(sz + n) >= PLIC){
+      return -1;
+    }
+    uint64 oldsz = sz;
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
     }
+    if(u2kvmcopy(p->pagetable, p->kernelpt, oldsz, sz) < 0){
+      uvmdealloc(p->pagetable, sz, oldsz);
+      return -1;
+    }
   } else if(n < 0){
+    uint64 oldsz = sz;
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    if(PGROUNDUP(sz) < PGROUNDUP(oldsz)){
+      int npages = (PGROUNDUP(oldsz) - PGROUNDUP(sz)) / PGSIZE;
+      uvmunmap(p->kernelpt, PGROUNDUP(sz), npages, 0);
+    }
   }
   p->sz = sz;
   return 0;
@@ -289,12 +350,14 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0 ||
+     u2kvmcopy(np->pagetable, np->kernelpt, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
   }
   np->sz = p->sz;
+  np->usyscall->pid = np->pid;
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -460,11 +523,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        proc_inithart(p->kernelpt);
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
+        kvminithart();
       }
       release(&p->lock);
     }
